@@ -1,0 +1,116 @@
+version: "3.9"
+
+services:
+  # -----------------------------
+  # PostgreSQL for Wiki.js
+  # -----------------------------
+  db:
+    image: postgres:15-alpine
+    container_name: wikijs-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: wiki
+      POSTGRES_USER: wikijs
+      POSTGRES_PASSWORD: wikijsrocks
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    logging:
+      driver: none
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U wikijs -d wiki"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - wikijs_qdrant
+
+  # -----------------------------
+  # Wiki.js
+  # -----------------------------
+  wiki:
+    image: ghcr.io/requarks/wiki:2
+    container_name: wikijs
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DB_TYPE: postgres 
+      DB_HOST: db
+      DB_PORT: 5432
+      DB_USER: wikijs
+      DB_PASS: wikijsrocks
+      DB_NAME: wiki
+    ports:
+      - "3001:3000"
+    volumes:
+      - wiki-data:/wiki/data
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 3000 || exit 1"]
+      interval: 30s
+      timeout: 7s
+      retries: 5
+    networks:
+      - wikijs_qdrant
+
+  # -----------------------------
+  # Qdrant Vector DB
+  # -----------------------------
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: qdrant
+    restart: unless-stopped
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - /opt/wiki-js-app/production.yaml:/qdrant/config/production.yaml:ro
+      - qdrant_data:/qdrant/storage   # ✅ fixed
+    networks:
+      - wikijs_qdrant
+
+  # -----------------------------
+  # Doc Embedding API
+  # -----------------------------
+  doc-embedding-api:
+    build:
+      context: ./doc-embedding-api
+      dockerfile: Dockerfile
+    container_name: doc-embedding-api
+    restart: unless-stopped
+    depends_on:
+      - qdrant
+    environment:
+      INGEST_API_SECRET: ${INGEST_API_SECRET}
+      QDRANT_URL: ${QDRANT_URL}
+      GROQ_API_KEY: ${GROQ_API_KEY}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      QDRANT_API_KEY: ${QDRANT_API_KEY}
+      KB_GIT_SSH_PRIVATE_KEY: ${KB_GIT_SSH_PRIVATE_KEY}
+      WIKIJS_ADMIN_EMAIL: ${WIKIJS_ADMIN_EMAIL}
+      WIKIJS_ADMIN_PASSWORD: ${WIKIJS_ADMIN_PASSWORD}
+      WIKIJS_DOMAIN: ${WIKIJS_DOMAIN}
+      QDRANT_COLLECTION_NAME: ${QDRANT_COLLECTION_NAME}
+      KB_GIT_BRANCH: ${KB_GIT_BRANCH}
+      KB_GIT_COMMIT_EMAIL: ${KB_GIT_COMMIT_EMAIL}
+      KB_GIT_COMMIT_NAME: ${KB_GIT_COMMIT_NAME}
+      KB_REPO_SSH_URL: ${KB_REPO_SSH_URL}
+    ports:
+      - "8002:8000"
+    networks:
+      - wikijs_qdrant
+
+# -----------------------------
+# Volumes
+# -----------------------------
+volumes:
+  db-data:
+  wiki-data:
+  qdrant_data:
+
+# -----------------------------
+# Network
+# -----------------------------
+networks:
+  wikijs_qdrant:
+    driver: bridge

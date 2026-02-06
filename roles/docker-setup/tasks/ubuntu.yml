@@ -1,0 +1,37 @@
+# This task file is to setup Docker and Docker-Compose on Ubuntu servers.
+- name: Install  dependencies for Docker Installation on Ubuntu
+  apt:
+    name: "{{ item }}"
+    state: present
+  loop: 
+    - apt-transport-https
+    - ca-certificates
+    - curl
+    - gnupg
+    - lsb-release
+
+- name: Add Docker's official GPG key
+  apt_key:
+    url: https://download.docker.com/linux/ubuntu/gpg
+    state: present
+
+- name: Set up the Docker stable repository
+  apt_repository:
+    repo: deb [arch=amd64] https://download.docker.com/linux/ubuntu focal stable
+    state: present
+
+- name: Update the apt package index
+  apt:
+    update_cache: yes
+
+- name: Install Docker and Docker-Compose on Ubuntu
+  apt:
+    name:
+      - docker-ce
+      - docker-ce-cli
+      - containerd.io
+      - docker-compose-plugin
+    state: present
+    update_cache: yes
+  notify: 
+    - Ubuntu Restart Docker Service

@@ -1,0 +1,291 @@
+# This is the playbook to install Docker and Docker-Compose on multiple servers using Ansible. And also execute the Bash script to deploy Wiki.js, Qdrant and Fast-API using Docker-Compose.
+# This Playbook will call out the roles defined in the 'roles' directory, which in our case is Docker-Setup.
+
+---
+- name: Install Docker and Docker-Compose on Multiple Servers & Check if the Docker is installed or not
+  hosts: servers
+  become: yes
+  vars_files:
+    - vars/secret.yaml
+  vars: # for modularizing the code
+    app_dir: /opt/wiki-js-app
+    repo_dir: /opt/wiki-js-knowledge-base
+    repo_url: "{{ (lookup('env','KB_REPO_HTTP_URL') | default(KB_REPO_HTTP_URL, true)).split('://')[-1] }}"       # Knowledge Base Repository URL
+    github_repo_owner: "{{ lookup('env', 'KB_REPO_OWNER') | default(KB_REPO_OWNER, true)}}" # Knowledge Base Repository Owner
+    github_repo_name: "{{ lookup('env', 'KB_REPO_NAME') | default(KB_REPO_NAME, true)}}"   # Knowledge Base Repository Name
+
+    # WikiJS Domain
+    wikijs_domain: "{{ lookup('env','WIKI_DOMAIN') | default(WIKI_DOMAIN, true)}}" # wiki.intelliconnectq.com
+    base_domain: "{{ wikijs_domain.split('.')[-2:] | join('.') }}" # intelliconnectq.com
+    branch: "main"
+    GITHUB_TOKEN: "{{ lookup('env','KB_REPO_GITHUB_TOKEN') | default(KB_REPO_GITHUB_TOKEN, true)}}" # GitHub Token with for deploying SSH Keys and Cloning Repo
+    wikijs_admin_email: "{{ lookup('env','WIKIJS_ADMIN_EMAIL') | default(WIKIJS_ADMIN_EMAIL, true)}}"
+
+    # variables used for nginx configuration
+    services:
+      - name: wikijs
+        domain: "{{ wikijs_domain }}"
+        port: 3001
+
+      - name: doc-api
+        domain: "docs-embeddings-qdrant.{{ base_domain }}"
+        port: 8002
+
+      - name: qdrant
+        domain: "qdrant.{{ base_domain }}"
+        port: 6333
+
+
+  tasks:
+    - name: Check if Docker is Installed or Not # will check if docker exist we can also check the binary for docker to know that docker exist or not.
+      command: docker --version
+      register: check_docker_installation
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Install Docker using role if not installed  # this role will execute when there will be no Docker Installed
+      include_role:
+        name: docker-setup
+      when: check_docker_installation.rc != 0
+
+    - name: Create Application Directory 
+      file:
+        path: "{{ app_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Copy docker-compose.yaml to remote server
+      copy:
+        src: docker-compose.yaml
+        dest: "{{ app_dir }}/docker-compose.yaml"
+
+    # Set private_key for doc-embeddings in .env
+    - name: Generate SSH key pair
+      openssh_keypair:
+        path: /root/.ssh/kb_ingest
+        type: rsa
+        size: 4096
+        force: false
+    
+    - name: Read private key
+      slurp:
+        src: /root/.ssh/kb_ingest
+      register: kb_private_key
+
+    - name: Read public key
+      slurp:
+        src: /root/.ssh/kb_ingest.pub
+      register: kb_public_key
+
+    - name: Set private key fact for .env
+      set_fact:
+        KB_GIT_SSH_PRIVATE_KEY: "{{ kb_private_key.content | b64decode }}"
+
+    - name: Create .env file for the secrets passed from semaphore
+      template:
+        src: .env.j2
+        dest: "{{ app_dir }}/.env"
+        owner: root
+        group: root
+        mode: '0600'
+
+
+    - name: Add deploy key to GitHub repository
+      uri:
+        url: "https://api.github.com/repos/{{ github_repo_owner }}/{{ github_repo_name }}/keys"
+        method: POST
+        headers:
+          Authorization: "token {{ GITHUB_TOKEN }}"
+          Accept: "application/vnd.github+json"
+        body_format: json
+        body:
+          title: "ansible-doc-embedding-key"
+          key: "{{ kb_public_key.content | b64decode }}"
+          read_only: false
+        status_code: [201, 422]
+  
+    - name: Create production.yaml file for the secrets passed from semaphore
+      template:
+        src: production.yaml.j2
+        dest: "{{ app_dir }}/production.yaml"
+        owner: root
+        group: root
+        mode: '0600'
+
+    - name: Copy doc embedding API
+      copy:
+        src: doc-embedding-api/
+        dest: "{{ app_dir }}/doc-embedding-api/"
+
+    # Clone Wiki-JS Knowledege-Base Repository and add "update-embedding.yaml" to repository
+    # at .github/workflows/update-embedding.yaml to trigger the pipeline whenever Docs get's updated inisde Wiki-JS
+    
+    - name: Create Directory to clone Repository
+      file:
+        path: "{{ repo_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Clone GitHub Repository using Ansible-Git-Module
+      git: 
+        repo: "https://{{ GITHUB_TOKEN }}@{{ repo_url  }}"
+        dest: "{{ repo_dir }}"
+        version: "main"
+
+    - name: Ensure GitHub workflows directory exists
+      file:
+        path: "{{ repo_dir }}/.github/workflows"
+        state: directory
+        mode: '0775'
+
+    - name: Configure git identity
+      shell: |
+        git config user.email "automation@intelliconnectq.com"
+        git config user.name "Ansible Automation"
+      args:
+        chdir: "{{ repo_dir }}"
+
+    - name: Copy update-embedding.yaml to repository
+      copy: 
+        src: update-embedding.yaml
+        dest: "{{ repo_dir }}/.github/workflows/update-embedding.yaml"
+
+    - name: Commit ahe push changes to github again
+      shell: |
+        git status --porcelain
+        git add .
+        git commit -m "Update files via Ansible" || echo "No changes to commit"
+        git push origin main
+      args:
+        chdir: "{{ repo_dir }}"
+
+    - name: Deploy stack using Docker Compose
+      command: docker compose up -d --build
+      args:
+        chdir: "{{ app_dir }}"
+
+    # ==============================
+    # NGINX + CERTBOT SETUP
+    # ==============================
+    - name: Check if Nginx is installed
+      command: nginx -v
+      register: nginx_check
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Install Nginx if not installed
+      apt:
+        name: nginx
+        state: present
+        update_cache: yes
+      when: nginx_check.rc != 0
+
+    - name: Ensure Nginx is running
+      service:
+        name: nginx
+        state: started
+        enabled: yes
+
+    - name: Check if Certbot is installed
+      command: certbot --version
+      register: certbot_check
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Install Certbot and Nginx plugin if not installed
+      apt:
+        name:
+          - certbot
+          - python3-certbot-nginx
+        state: present
+        update_cache: yes
+      when: certbot_check.rc != 0
+
+    - name: Check if SSL cert exists
+      stat:
+        path: "/etc/letsencrypt/live/{{ item.domain }}/fullchain.pem"
+      register: ssl_check
+      loop: "{{ services }}"
+      loop_control:
+        label: "{{ item.domain }}"
+    
+    - name: Create Nginx site configurations (HTTP only, first run)
+      template:
+        src: nginx-service.conf.j2
+        dest: "/etc/nginx/sites-available/{{ item.item.name }}"
+        mode: '0644'
+      when: not item.stat.exists
+      loop: "{{ ssl_check.results }}"
+
+    - name: Enable Nginx sites
+      file:
+        src: "/etc/nginx/sites-available/{{ item.name }}"
+        dest: "/etc/nginx/sites-enabled/{{ item.name }}"
+        state: link
+        force: yes
+      loop: "{{ services }}"
+
+
+    - name: Remove default Nginx site
+      file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+
+    - name: Test Nginx config
+      command: nginx -t
+      changed_when: false
+
+    - name: Reload Nginx
+      service:
+        name: nginx
+        state: reloaded
+
+    - name: Obtain SSL using Certbot
+      command: >
+        certbot --nginx
+        -d {{ item.item.domain }}
+        --non-interactive
+        --agree-tos
+        -m {{ wikijs_admin_email }}
+        --redirect
+      when: not item.stat.exists
+      loop: "{{ ssl_check.results }}"
+      loop_control:
+        label: "{{ item.item.domain }}"
+
+    - name: Wait for doc-embedding-api to be up
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:8002/health"
+        method: GET
+        return_content: no
+        status_code: 200
+      register: result
+      retries: 10
+      delay: 15
+      until: result is succeeded and result.status == 200
+
+    - name: Wait for WikiJS to be ready
+      uri:
+        url: "http://127.0.0.1:3001"
+        method: GET
+        status_code: [200, 302, 401]
+      register: wikijs_result
+      retries: 20
+      delay: 15
+      until: wikijs_result.status in [200, 302, 401]
+
+    - name: Pause for 60 seconds to ensure services are fully up
+      pause:
+        seconds: 60
+
+    - name: Hit doc-embedding-api to trigger admin/bootstrap logic
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:8002/start-process"
+        method: POST
+        headers:
+          Content-Type: application/json
+        status_code: [200, 201, 204]

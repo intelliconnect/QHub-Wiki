@@ -1,0 +1,23 @@
+# This Playbook is to update the LLM keys, which are passed to docs-embeddings-qdrand API as [ ENV ] variables.
+# In the below file only the varibles changed inside vars/secrets OR SemaphoreUI will be updated inside .env file of doc-embeddings-api service. Rest all will remain the same.
+---
+- name: Update LLM Keys Environment Variables
+  hosts: servers # test locally 1st
+  become: yes
+  vars_files:
+    - vars/secret.yaml
+  vars: # for modularizing the code
+    app_dir: /opt/wiki-js-app
+  tasks:
+    - name: Update .env with the New LLM Keys passed from secrets OR semaphore
+      template:
+        src: .env.j2
+        dest: "{{ app_dir }}/.env"
+        owner: root
+        group: root
+        mode: '0600'
+
+    - name: Restart Doc-Embeddings-API to apply new environment variables
+      command: docker compose up -d --no-deps --force-recreate doc-embedding-api
+      args:
+        chdir: "{{ app_dir }}"

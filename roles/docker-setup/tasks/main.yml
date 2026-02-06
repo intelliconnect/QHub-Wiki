@@ -1,0 +1,14 @@
+#SPDX-License-Identifier: MIT-0
+---
+# tasks file for docker-setup, here we will call out the different tasks defined in this directory
+
+
+# This will check the distribution if it is Ubuntu then it will call "ubuntu.yml"
+- name: Install Docker on Ubuntu Servers
+  include_tasks: ubuntu.yml
+  when: ansible_facts['os_family'] == "Debian" and ansible_facts['distribution'] == "Ubuntu"
+
+# This will check the distribution if it is Amazon Linux then it will call "amazon.yml"
+- name: Install Docker on Amazon Linux Servers
+  include_tasks: amazon.yml
+  when: ansible_facts['os_family'] == "RedHat" and ansible_facts['distribution'] == "Amazon"

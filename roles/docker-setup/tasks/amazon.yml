@@ -1,0 +1,25 @@
+# This task file is for installing Docker and Docker-Compose on Amazon Linux servers.
+---
+- name: Install dependencies for Docker Installation on Amazon Linux
+  dnf:
+    name: "{{ item }}"
+    state: present
+  loop:
+    - dnf-plugins-core
+
+- name: Add Docker's official repository
+  dnf_repository:
+    name: docker
+    description: Docker Repository
+    baseurl: https://download.docker.com/linux/rhel/docker-ce.repo
+
+- name: Install Docker and Docker-Compose on Amazon Linux
+  dnf:
+    name:
+      - docker-ce
+      - docker-ce-cli
+      - containerd.io
+      - docker-compose-plugin
+    state: present
+  notify:
+    - Amazon Restart Docker Service

@@ -1,0 +1,149 @@
+name: Incremental Ingestion
+on:
+  push:
+    paths:
+      - '**/*.md'
+
+jobs:
+  ingest-changed-files:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2  # Fetch last 2 commits to compare
+      
+      - name: Get changed markdown files
+        id: changed-files
+        run: |
+          # Get list of changed .md files in this commit
+          git diff --name-only HEAD^ HEAD | grep '\.md$' > changed_files.txt || true
+          
+          # Also get deleted files
+          git diff --name-only --diff-filter=D HEAD^ HEAD | grep '\.md$' > deleted_files.txt || true
+          
+          echo "=== Changed/Added Files ==="
+          cat changed_files.txt
+          echo ""
+          echo "=== Deleted Files ==="
+          cat deleted_files.txt
+      
+      - name: Send changed files to ingestion server
+        env:
+          INGEST_TOKEN: ${{ secrets.INGEST_API_SECRET }}
+          INGEST_URL: ${{ secrets.INGEST_URL }}
+        run: |
+          python3 << 'EOF'
+          import json, os, urllib.request
+          
+          repo = os.environ.get("GITHUB_REPOSITORY", "")
+          commit = os.environ.get("GITHUB_SHA", "")
+          ingest_token = os.environ.get("INGEST_TOKEN", "")
+          ingest_url = os.environ.get("INGEST_URL", "")
+          
+          if not ingest_url or not ingest_token:
+              print("ERROR: INGEST_URL or INGEST_TOKEN not set")
+              exit(1)
+          
+          print(f"\nRepository: {repo}")
+          print(f"Commit: {commit}\n")
+          
+          success_count = 0
+          error_count = 0
+          
+          # Process changed/added files
+          try:
+              changed_paths = [p.strip() for p in open('changed_files.txt').readlines() if p.strip()]
+          except FileNotFoundError:
+              changed_paths = []
+          
+          print(f"Changed/Added files: {len(changed_paths)}")
+          
+          for path in changed_paths:
+              print(f"\n📝 Processing: {path}")
+              
+              try:
+                  with open(path, 'r', encoding='utf-8') as fh:
+                      content = fh.read()
+              except Exception as e:
+                  print(f"  ❌ Error reading file: {e}")
+                  error_count += 1
+                  continue
+              
+              payload = {
+                  "path": path,
+                  "repo": repo,
+                  "commit": commit,
+                  "deleted": False,
+                  "content": content
+              }
+              
+              try:
+                  req = urllib.request.Request(
+                      ingest_url,
+                      data=json.dumps(payload).encode('utf-8'),
+                      headers={
+                          'Content-Type': 'application/json',
+                          'X-Ingest-Token': ingest_token
+                      },
+                      method='POST'
+                  )
+                  
+                  with urllib.request.urlopen(req, timeout=30) as response:
+                      if response.status == 200:
+                          print(f"  ✅ Successfully ingested")
+                          success_count += 1
+                      else:
+                          print(f"  ❌ Server returned status {response.status}")
+                          error_count += 1
+              except Exception as e:
+                  print(f"  ❌ Error sending to server: {e}")
+                  error_count += 1
+          
+          # Process deleted files
+          try:
+              deleted_paths = [p.strip() for p in open('deleted_files.txt').readlines() if p.strip()]
+          except FileNotFoundError:
+              deleted_paths = []
+          
+          print(f"\nDeleted files: {len(deleted_paths)}")
+          
+          for path in deleted_paths:
+              print(f"\n🗑️  Processing deletion: {path}")
+              
+              payload = {
+                  "path": path,
+                  "repo": repo,
+                  "commit": commit,
+                  "deleted": True,
+                  "content": ""
+              }
+              
+              try:
+                  req = urllib.request.Request(
+                      ingest_url,
+                      data=json.dumps(payload).encode('utf-8'),
+                      headers={
+                          'Content-Type': 'application/json',
+                          'X-Ingest-Token': ingest_token
+                      },
+                      method='POST'
+                  )
+                  
+                  with urllib.request.urlopen(req, timeout=30) as response:
+                      if response.status == 200:
+                          print(f"  ✅ Successfully marked as deleted")
+                          success_count += 1
+                      else:
+                          print(f"  ❌ Server returned status {response.status}")
+                          error_count += 1
+              except Exception as e:
+                  print(f"  ❌ Error sending to server: {e}")
+                  error_count += 1
+          
+          print(f"\n{'='*70}")
+          print(f"Summary: {success_count} successful, {error_count} failed")
+          print(f"{'='*70}")
+          
+          if error_count > 0:
+              exit(1)
