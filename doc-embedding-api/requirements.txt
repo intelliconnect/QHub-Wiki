@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+pydantic
+qdrant-client
+fastembed
+python-multipart
+python-dotenv
+groq
+anthropic
