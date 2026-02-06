@@ -60,13 +60,6 @@ See [QHub Wiki Setup using SemaphoreUI](/docs/SETUP_SEMAPHORE_UI.md)
 
 
 
-## 📊 Proven Results
-
-* **50% faster onboarding** - New hires self-serve answers
-* **$10k+ annual SaaS savings** - Replaces Notion/Confluence
-
-**Verify**: `curl https://wiki.mydomain.com/health`
-
 ## 💬 Support
 
 * 🐛 Issues: [GitHub Discussions](https://github.com/intelliconnect/QHub-Wiki/discussions)
