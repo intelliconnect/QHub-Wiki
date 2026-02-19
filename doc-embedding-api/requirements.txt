@@ -2,7 +2,7 @@ fastapi
 uvicorn
 pydantic
 qdrant-client
-fastembed
+fastembed[sparse]>=0.3.0
 python-multipart
 python-dotenv
 groq

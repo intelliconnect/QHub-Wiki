@@ -12,8 +12,12 @@ from pydantic import BaseModel
 import requests
 from qdrant_client import QdrantClient
 from qdrant_client.http import models
-from qdrant_client.models import Distance, VectorParams, PointStruct, PayloadSchemaType
-from fastembed.embedding import FlagEmbedding as TextEmbedding
+from qdrant_client.models import (
+    Distance, VectorParams, PointStruct, PayloadSchemaType,
+    SparseVectorParams, SparseIndexParams, SparseVector
+)
+from fastembed import TextEmbedding
+from fastembed.sparse.bm25 import Bm25 as SparseTextEmbedding
 from groq import Groq
 import anthropic
 
@@ -60,21 +64,25 @@ KB_GIT_COMMIT_NAME = os.getenv("KB_GIT_COMMIT_NAME")
 KB_GIT_SSH_PRIVATE_KEY = os.getenv("KB_GIT_SSH_PRIVATE_KEY", "")
 use_https = QDRANT_URL.startswith("https://") if QDRANT_URL else False
 
+
 qdrant_port = 443 if use_https else 6333
 
 qdrant_client = QdrantClient(
     url=QDRANT_URL,
     api_key=QDRANT_API_KEY,
-    timeout=60,  
+    timeout=60,
     prefer_grpc=False,
-    https=use_https, 
-    port=qdrant_port 
+    https=use_https,
+    port=qdrant_port
 )
  
 
 embedding_model = TextEmbedding(model_name="BAAI/bge-small-en-v1.5", max_length=512)
+sparse_model = SparseTextEmbedding(model_name="Qdrant/bm25")
+
 groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
+
 
 class IngestPayload(BaseModel):
     path: str
@@ -99,6 +107,7 @@ class SearchResult(BaseModel):
     score: float
     chunk_index: int
     total_chunks: int
+
 
 def extract_frontmatter(content: str) -> tuple:
     frontmatter = {}
@@ -165,11 +174,18 @@ def create_collection_if_not_exists():
             logger.info("Creating collection %s", COLLECTION_NAME)
             qdrant_client.create_collection(
                 collection_name=COLLECTION_NAME,
-                vectors_config=VectorParams(size=384, distance=Distance.COSINE)
+                vectors_config={
+                    "dense": VectorParams(size=384, distance=Distance.COSINE)
+                },
+                sparse_vectors_config={
+                    "sparse": SparseVectorParams(
+                        index=SparseIndexParams(on_disk=False)
+                    )
+                }
             )
             logger.info("Creating payload indexes")
             ensure_indexes_exist()
-            logger.info("Collection created with indexes")
+            logger.info("Collection created with hybrid vector support")
         else:
             logger.info("Collection %s already exists", COLLECTION_NAME)
             ensure_indexes_exist()
@@ -209,6 +225,45 @@ def format_ssh_key(ssh_key: str) -> str:
 
     return ssh_key
 
+def hybrid_search(query: str, limit: int):
+    """
+    Perform a hybrid search using Reciprocal Rank Fusion (RRF) over dense and sparse vectors.
+
+    This function embeds the input query into both dense and sparse vector spaces and
+    queries Qdrant with both representations. The results are combined using RRF to
+    produce a single ranked list of search results.
+
+    :param query: The textual search query to embed and search for.
+    :param limit: The maximum number of search results to return after fusion.
+    :return: A list of search results (Qdrant points) returned by the hybrid RRF search.
+    """
+    dense_embedding = list(embedding_model.embed([query]))[0].tolist()
+    sparse_result = list(sparse_model.embed([query]))[0]
+
+    return qdrant_client.query_points(
+        collection_name=COLLECTION_NAME,
+        prefetch=[
+            models.Prefetch(
+                query=dense_embedding,
+                using="dense",
+                limit=limit * 3
+            ),
+            models.Prefetch(
+                query=SparseVector(
+                    indices=sparse_result.indices.tolist(),
+                    values=sparse_result.values.tolist()
+                ),
+                using="sparse",
+                limit=limit * 3
+            ),
+        ],
+        query=models.FusionQuery(fusion=models.Fusion.RRF),
+        limit=limit,
+        with_payload=True,
+        with_vectors=False
+    ).points
+
+
 @app.on_event("startup")
 async def startup_event():
     logger.info("Starting Knowledge Base Server")
@@ -221,7 +276,7 @@ async def root():
         "service": "Knowledge Base - Complete System",
         "endpoints": {
             "ingestion": "/ingest - Add/update documents",
-            "search": "/search - Vector similarity search",
+            "search": "/search - Hybrid RRF search (dense + sparse)",
             "rag": "/rag - AI-powered answers",
             "wiki_setup": "/start-process - Initialize Wiki.js",
             "stats": "/stats - Collection statistics",
@@ -230,6 +285,7 @@ async def root():
         "features": {
             "chunking": f"{CHUNK_SIZE} words per chunk",
             "overlap": f"{CHUNK_OVERLAP} words",
+            "search_mode": "Hybrid RRF (Dense COSINE + Sparse BM25)",
             "ai_models": {
                 "groq": "llama-3.3-70b-versatile" if groq_client else "not configured",
                 "claude": "claude-sonnet-4-5-20250929" if anthropic_client else "not configured"
@@ -247,6 +303,7 @@ async def health():
             "groq": "ready" if groq_client else "not configured",
             "claude": "ready" if anthropic_client else "not configured",
             "collection": COLLECTION_NAME,
+            "search_mode": "Hybrid RRF",
             "wikijs_configured": bool(WIKIJS_DOMAIN and WIKIJS_ADMIN_EMAIL)
         }
     except Exception as e:
@@ -308,8 +365,8 @@ async def ingest_document(
         logger.info("Generated %s chunks for %s", len(chunks), payload.path)
         points = []
         for idx, chunk in enumerate(chunks):
-            embeddings = list(embedding_model.embed([chunk]))
-            embedding_vector = embeddings[0].tolist()
+            dense_embedding = list(embedding_model.embed([chunk]))[0].tolist()
+            sparse_result = list(sparse_model.embed([chunk]))[0]
             point_id = generate_point_id(payload.path, payload.repo, idx)
             metadata = {
                 "path": payload.path,
@@ -325,7 +382,13 @@ async def ingest_document(
             }
             points.append(PointStruct(
                 id=point_id,
-                vector=embedding_vector,
+                vector={
+                    "dense": dense_embedding,
+                    "sparse": SparseVector(
+                        indices=sparse_result.indices.tolist(),
+                        values=sparse_result.values.tolist()
+                    )
+                },
                 payload=metadata
             ))
         qdrant_client.upsert(collection_name=COLLECTION_NAME, points=points)
@@ -346,14 +409,7 @@ async def ingest_document(
 async def search_documents(request: SearchRequest):
     try:
         logger.info("Search query received: %s", request.query)
-        query_embedding = list(embedding_model.embed([request.query]))[0].tolist()
-        results = qdrant_client.query_points(
-            collection_name=COLLECTION_NAME,
-            query=query_embedding,
-            limit=request.limit,
-            with_payload=True,
-            with_vectors=False
-        ).points
+        results = hybrid_search(request.query, request.limit)
         logger.info("Search returned %s results", len(results))
         search_results = []
         for result in results:
@@ -383,14 +439,7 @@ async def rag_query(request: RAGRequest):
         if request.llm_provider == "claude" and not anthropic_client:
             raise HTTPException(status_code=503, detail="Claude is not configured")
 
-        query_embedding = list(embedding_model.embed([request.query]))[0].tolist()
-        results = qdrant_client.query_points(
-            collection_name=COLLECTION_NAME,
-            query=query_embedding,
-            limit=request.limit,
-            with_payload=True,
-            with_vectors=False
-        ).points
+        results = hybrid_search(request.query, request.limit)
         logger.info("RAG retrieved %s relevant chunks", len(results))
 
         if not results:
@@ -529,7 +578,7 @@ async def start_wiki_setup_process():
 
         admin_data = admin_response.json()
         results["step1_admin_creation"] = admin_data
-        logger.info("✓ Admin user created successfully: %s", admin_data)
+        logger.info("Admin user created successfully: %s", admin_data)
 
         # wait for Wiki.js to complete setup and restart services
         logger.info("Waiting 10 seconds for Wiki.js to complete initialization...")
@@ -595,7 +644,7 @@ async def start_wiki_setup_process():
                             "jwt_obtained": True,
                             "attempts": attempt
                         }
-                        logger.info("✓ Login successful on attempt %d", attempt)
+                        logger.info("Login successful on attempt %d", attempt)
                         login_success = True
                         break
                     else:
@@ -815,7 +864,7 @@ async def start_wiki_setup_process():
             raise HTTPException(status_code=500, detail=f"Git config failed: {error_msg}")
 
         results["step3_git_config"] = git_data["data"]["storage"]["updateTargets"]["responseResult"]
-        logger.info("✓ Git storage configured successfully")
+        logger.info("Git storage configured successfully")
 
         # update guests group permissions
         logger.info("Step 4: Updating Guests group permissions")
@@ -880,11 +929,11 @@ async def start_wiki_setup_process():
             raise HTTPException(status_code=500, detail=f"Guest permissions failed: {error_msg}")
 
         results["step4_guest_permissions"] = guest_data["data"]["groups"]["update"]["responseResult"]
-        logger.info("✓ Guests group permissions updated successfully")
+        logger.info("Guests group permissions updated successfully")
 
         return {
             "status": "success",
-            "message": "Wiki.js setup completed successfully - Admin created, logged in, Git configured, and guest permissions set",
+            "message": "Wiki.js setup completed successfully",
             "details": results
         }
 
@@ -896,7 +945,7 @@ async def start_wiki_setup_process():
     except Exception as e:
         logger.exception("Wiki setup process failed: %s", e)
         raise HTTPException(status_code=500, detail=f"Setup failed: {str(e)}")
- 
+
 
 @app.get("/stats")
 async def collection_stats():
@@ -905,13 +954,13 @@ async def collection_stats():
         return {
             "collection_name": COLLECTION_NAME,
             "total_points": collection_info.points_count,
-            "vector_size": collection_info.config.params.vectors.size,
-            "distance": collection_info.config.params.vectors.distance.name,
+            "search_mode": "Hybrid RRF (Dense + Sparse BM25)",
             "status": "active"
         }
     except Exception as e:
         logger.exception("Stats retrieval failed: %s", e)
         raise HTTPException(status_code=500, detail=f"Stats failed: {str(e)}")
+
 
 if __name__ == "__main__":
     import uvicorn
