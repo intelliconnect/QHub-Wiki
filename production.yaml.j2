@@ -1,7 +1,7 @@
 log_level: INFO
 
 service: 
-  api_key: {{ lookup('env', 'QDRANT_API_KEY') | default(QDRANT_API_KEY, test) }}  
+  api_key: {{ lookup('env', 'QDRANT_API_KEY') | default(QDRANT_API_KEY) }}  
   host: 0.0.0.0  
   http_port: 6333  
   grpc_port: 6334
