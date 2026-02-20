@@ -1,3 +1,4 @@
+# Code for doc-embedding-api (FastAPI)
 import json
 import logging
 import os
